@@ -5,14 +5,13 @@
 	╚══════════════════════════════════════════════════════════════════════╝
 
 	v3.1 CHANGES
-	  - Spin is now truly infinite accumulator-based (not cos oscillation)
-	    Applied via a running CFrame so lerp stays smooth and it never resets
-	  - Axis lock actually works: reads Part0's world CFrame, computes the
-	    inverse rotation for the locked axes, and applies a counter-CFrame
-	    each frame — so locked axes stay world-aligned regardless of how the
-	    root moves. Multiple axes can be locked simultaneously.
-	  - Export has zero spaces (compact paste-ready format)
-	  - Sub-axis layout order fixed so bodies don't overlap in scroll frame
+	  - Per-axis sine:  X, Y, Z each have their own Amp / Speed / Offset / Reverse
+	  - Per-axis spin:  X, Y, Z each have their own Speed / Reverse / Enable
+	    Uses continuous angular motion; speed is scaled in the runtime
+	  - Accessories detected as direct Accessory children of the character,
+	    reading the Handle's Weld/Motor6D for the C0 offset
+	  - Typed values still bypass slider limits
+	  - Spin no longer resets / glitches
 --]]
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -27,7 +26,11 @@ local CoreGui          = game:GetService("CoreGui")
 local Camera           = workspace.CurrentCamera
 
 local player = Players.LocalPlayer
-local char   = player.Character or player.CharacterAdded:Wait()
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  WAIT FOR CHARACTER
+-- ═══════════════════════════════════════════════════════════════════════
+local char = player.Character or player.CharacterAdded:Wait()
 
 local function waitForRig(c)
 	local t0 = tick()
@@ -37,6 +40,9 @@ local function waitForRig(c)
 end
 waitForRig(char)
 
+-- ═══════════════════════════════════════════════════════════════════════
+--  DISABLE ROBLOX DEFAULT ANIMATE SCRIPT
+-- ═══════════════════════════════════════════════════════════════════════
 local function disableAnimate(c)
 	local anim = c:FindFirstChild("Animate")
 	if anim and anim:IsA("LocalScript") then anim.Disabled = true end
@@ -44,7 +50,7 @@ local function disableAnimate(c)
 	if hum then
 		local animator = hum:FindFirstChildOfClass("Animator")
 		if animator then
-			for _,t in ipairs(animator:GetPlayingAnimationTracks()) do t:Stop(0) end
+			for _, t in ipairs(animator:GetPlayingAnimationTracks()) do t:Stop(0) end
 		end
 	end
 end
@@ -53,7 +59,7 @@ disableAnimate(char)
 -- ═══════════════════════════════════════════════════════════════════════
 --  SCREEN SCALING
 -- ═══════════════════════════════════════════════════════════════════════
-local BASE_W,BASE_H = 1920,1080
+local BASE_W, BASE_H = 1920, 1080
 local function calcScale()
 	local vp = Camera.ViewportSize
 	return math.min(vp.X/BASE_W, vp.Y/BASE_H)
@@ -67,30 +73,22 @@ Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() S=calcScale()
 -- ═══════════════════════════════════════════════════════════════════════
 --  MATH
 -- ═══════════════════════════════════════════════════════════════════════
-local cf      = CFrame.new
-local angles  = CFrame.Angles
+local cf     = CFrame.new
+local angles = CFrame.Angles
 local function cfMul(a,b) return a*b end
 local function Lerp(a,b,t) return a:Lerp(b,t) end
-local pi      = math.pi
-local sin     = math.sin
-local fmt     = string.format
-local TWO_PI  = pi*2
+local pi     = math.pi
+local sin    = math.sin
+local fmt    = string.format
+local TWO_PI = pi*2
 
 -- ═══════════════════════════════════════════════════════════════════════
---  R6 DEFAULTS
+--  DISPLAY NAMES
 -- ═══════════════════════════════════════════════════════════════════════
-local R6_DEF = {
-	RootJoint     = {pos=cf(0,0,0),     rot=angles(-pi/2,0,pi)},
-	Neck          = {pos=cf(0,1,0),     rot=angles(-pi/2,0,pi)},
-	RightShoulder = {pos=cf(1,0.5,0),   rot=angles(0,pi/2,0)  },
-	LeftShoulder  = {pos=cf(-1,0.5,0),  rot=angles(0,-pi/2,0) },
-	RightHip      = {pos=cf(0.5,-1,0),  rot=angles(0,pi/2,0)  },
-	LeftHip       = {pos=cf(-0.5,-1,0), rot=angles(0,-pi/2,0) },
-}
 local DISPLAY_NAMES = {
-	RootJoint="Torso (RootJoint)",       Neck="Head (Neck)",
+	RootJoint="Torso (RootJoint)", Neck="Head (Neck)",
 	RightShoulder="R Arm (RightShoulder)", LeftShoulder="L Arm (LeftShoulder)",
-	RightHip="R Leg (RightHip)",          LeftHip="L Leg (LeftHip)",
+	RightHip="R Leg (RightHip)", LeftHip="L Leg (LeftHip)",
 }
 local MIRROR_MAP = {
 	RightShoulder="LeftShoulder", LeftShoulder="RightShoulder",
@@ -99,102 +97,166 @@ local MIRROR_MAP = {
 local R6_ORDER = {"RootJoint","Neck","RightShoulder","LeftShoulder","RightHip","LeftHip"}
 
 -- ═══════════════════════════════════════════════════════════════════════
---  JOINT DATA
+--  JOINT DATA (per-axis sine motion and continuous spin)
 -- ═══════════════════════════════════════════════════════════════════════
+--[[
+	Sine per axis: amp * sin(phase * speed + offset), in radians.
+	Position sine uses studs; rotation sine uses radians.
+	Spin is continuous: phase * speed * 0.05, in radians.
+]]
+
 local function makeSineAxis()
-	return {amp=0,speed=1,offset=0,reverse=false}
+	return { amp=0, speed=1, offset=0, reverse=false }
 end
 local function makeSpinAxis()
-	-- _angle accumulates forever; applied as a running CFrame offset
-	return {enabled=false,speed=1,reverse=false,_angle=0}
+	return { enabled=false, speed=1, reverse=false }
 end
 
-local function makeJointData(motor)
-	local name = motor.Name
-	local def  = R6_DEF[name]
-	local bpx,bpy,bpz,brx,bry,brz
-	if def then
-		bpx,bpy,bpz = def.pos.X,def.pos.Y,def.pos.Z
-		brx,bry,brz = def.rot:ToEulerAnglesXYZ()
-	else
-		local c0 = motor.C0 or CFrame.new()
-		bpx,bpy,bpz = c0.X,c0.Y,c0.Z
-		brx,bry,brz = c0:ToEulerAnglesXYZ()
-	end
+local function makeJointData(motor, key, restC0, isAccessory)
+	local name = key or motor.Name
+	local c0 = restC0 or (motor and motor.C0) or CFrame.new()
+	local bpx,bpy,bpz = c0.X, c0.Y, c0.Z
+	local brx,bry,brz = c0:ToEulerAnglesXYZ()
+
 	return {
 		name=name, motor=motor, enabled=true,
-		posX=bpx,posY=bpy,posZ=bpz,
-		rotX=brx,rotY=bry,rotZ=brz,
-		sineX=makeSineAxis(),sineY=makeSineAxis(),sineZ=makeSineAxis(),
-		sinePosX=makeSineAxis(),sinePosY=makeSineAxis(),sinePosZ=makeSineAxis(),
-		spinX=makeSpinAxis(),spinY=makeSpinAxis(),spinZ=makeSpinAxis(),
-		lockX=false,lockY=false,lockZ=false,
+		restC0=c0, isAccessory=isAccessory or false,
+		-- base transform
+		posX=bpx, posY=bpy, posZ=bpz,
+		rotX=brx, rotY=bry, rotZ=brz,
+		-- per-axis rotation sine
+		sineX=makeSineAxis(), sineY=makeSineAxis(), sineZ=makeSineAxis(),
+		-- per-axis position sine
+		sinePosX=makeSineAxis(), sinePosY=makeSineAxis(), sinePosZ=makeSineAxis(),
+		-- continuous spin, internally scaled by 0.05
+		spinX=makeSpinAxis(), spinY=makeSpinAxis(), spinZ=makeSpinAxis(),
+		-- axis lock
+		lockX=false, lockY=false, lockZ=false,
+		-- PART SELF ROTATION
+		-- Applied after normal position/rotation so the part rotates around itself.
+		baseRotX = 0,
+		baseRotY = 0,
+		baseRotZ = 0,
+		baseRotationFirst = false,
+
+		baseSineX = makeSineAxis(),
+		baseSineY = makeSineAxis(),
+		baseSineZ = makeSineAxis(),
+
+		baseSpinX = makeSpinAxis(),
+		baseSpinY = makeSpinAxis(),
+		baseSpinZ = makeSpinAxis(),
+
+		selfPivotX = 0,
+		selfPivotY = 0,
+		selfPivotZ = 0,
+		restSelfPivotX = 0,
+		restSelfPivotY = 0,
+		restSelfPivotZ = 0,
 	}
 end
 
+local function resetJointData(d)
+	local motor = d.isAccessory and d.weld or d.motor
+	if not motor or not d.restC0 then return end
+	local fresh = makeJointData(motor, d.name, d.restC0, d.isAccessory)
+	fresh.weld = d.weld
+	fresh.accessoryName = d.accessoryName
+	fresh.restSelfPivotX, fresh.restSelfPivotY, fresh.restSelfPivotZ = d.restSelfPivotX or 0, d.restSelfPivotY or 0, d.restSelfPivotZ or 0
+	fresh.selfPivotX, fresh.selfPivotY, fresh.selfPivotZ = fresh.restSelfPivotX, fresh.restSelfPivotY, fresh.restSelfPivotZ
+	for k, v in pairs(fresh) do d[k] = v end
+end
+
 -- ═══════════════════════════════════════════════════════════════════════
---  DETECT MOTORS + ACCESSORIES
+--  DETECT ALL MOTORS + ACCESSORIES
+--
+--  Body joints:   Motor6D descendants anywhere in character
+--  Accessories:   Direct Accessory children of character
+--                 → their Handle part → Weld / Motor6D on Handle
 -- ═══════════════════════════════════════════════════════════════════════
 local allJointData = {}
 local jointOrder   = {}
 
-local function getHandleWeld(acc)
-	local handle = acc:FindFirstChild("Handle")
+local function getHandleJoint(accessory)
+	local handle = accessory:FindFirstChild("Handle")
 	if not handle then return nil end
-	for _,v in ipairs(handle:GetChildren()) do
-		if v:IsA("Motor6D") or v:IsA("Weld") then return v end
+	for _, v in ipairs(handle:GetChildren()) do
+		if v:IsA("Motor6D") or v:IsA("Weld") then
+			return v
+		end
 	end
-	for _,v in ipairs(handle:GetChildren()) do
-		if v:IsA("WeldConstraint") then return v end
+	-- WeldConstraint has no editable C0, so it is deliberately not exposed
+	-- as an animatable joint.
+	return nil
+end
+
+local function getAccessorySelfPivot(accessory)
+	local handle = accessory:FindFirstChild("Handle")
+	if not handle then return 0, 0, 0 end
+	local sm = handle:FindFirstChildOfClass("SpecialMesh")
+	if sm then
+		local off = sm.Offset
+		return off.X, off.Y, off.Z
 	end
+	return 0, 0, 0
 end
 
 local function detectAllMotors(c)
-	allJointData={}; jointOrder={}
-	local seen={}
+	allJointData = {}
+	jointOrder   = {}
+	local seen = {}
+	local bodyMotors = {}
 
-	local bodyMotors={}
-	for _,v in ipairs(c:GetDescendants()) do
-		if v:IsA("Motor6D") then
-			if not bodyMotors[v.Name] then bodyMotors[v.Name]=v end
+	local function uniqueKey(baseKey)
+		local key, suffix = baseKey, 2
+		while seen[key] do
+			key = baseKey .. "_" .. suffix
+			suffix = suffix + 1
 		end
+		seen[key] = true
+		return key
 	end
 
-	for _,name in ipairs(R6_ORDER) do
-		if bodyMotors[name] and not seen[name] then
-			allJointData[name]=makeJointData(bodyMotors[name])
-			table.insert(jointOrder,name)
-			seen[name]=true
-			bodyMotors[name]=nil
+	local function isInsideAccessory(instance)
+		local parent = instance.Parent
+		while parent and parent ~= c do
+			if parent:IsA("Accessory") then return true end
+			parent = parent.Parent
 		end
+		return false
 	end
 
-	local extras={}
-	for k in pairs(bodyMotors) do table.insert(extras,k) end
-	table.sort(extras)
-	for _,key in ipairs(extras) do
-		if not seen[key] then
-			allJointData[key]=makeJointData(bodyMotors[key])
-			table.insert(jointOrder,key)
-			seen[key]=true
+	for _, v in ipairs(c:GetDescendants()) do
+		if v:IsA("Motor6D") and not isInsideAccessory(v) then
+			table.insert(bodyMotors, v)
 		end
 	end
+	table.sort(bodyMotors, function(a, b)
+		local ai, bi = table.find(R6_ORDER, a.Name), table.find(R6_ORDER, b.Name)
+		if ai and bi then return ai < bi end
+		if ai then return true end
+		if bi then return false end
+		return a.Name < b.Name
+	end)
 
-	-- Accessories: direct Accessory children of character
-	for _,child in ipairs(c:GetChildren()) do
+	for _, motor in ipairs(bodyMotors) do
+		local key = uniqueKey(motor.Name)
+		allJointData[key] = makeJointData(motor, key, motor.C0, false)
+		table.insert(jointOrder, key)
+	end
+
+	for _, child in ipairs(c:GetChildren()) do
 		if child:IsA("Accessory") then
-			local weld=getHandleWeld(child)
-			if weld and not (weld:IsA("WeldConstraint")) then
-				local key=child.Name
-				local base=key; local n=2
-				while seen[key] do key=base.."_"..n; n=n+1 end
-				local data=makeJointData(weld)
-				data.name=key
-				data.isAccessory=true
-				data.weld=weld
-				allJointData[key]=data
-				table.insert(jointOrder,key)
-				seen[key]=true
+			local weld = getHandleJoint(child)
+			if weld then
+				local key = uniqueKey(child.Name)
+				local data = makeJointData(weld, key, weld.C0, true)
+				data.accessoryName = child.Name
+				data.weld = weld
+				data.selfPivotX, data.selfPivotY, data.selfPivotZ = getAccessorySelfPivot(child)
+				data.restSelfPivotX, data.restSelfPivotY, data.restSelfPivotZ = data.selfPivotX, data.selfPivotY, data.selfPivotZ
+				allJointData[key] = data
+				table.insert(jointOrder, key)
 			end
 		end
 	end
@@ -205,234 +267,212 @@ detectAllMotors(char)
 -- ═══════════════════════════════════════════════════════════════════════
 --  UNDO / REDO
 -- ═══════════════════════════════════════════════════════════════════════
-local undoStack,redoStack={},{}
+local undoStack, redoStack = {}, {}
+local rebuildJointUI
+local refreshJointSections
+local resetAllJointData
 
 local function deepCopy(t)
 	if type(t)~="table" then return t end
 	local c={}
 	for k,v in pairs(t) do
-		if k~="motor" and k~="weld" then c[k]=deepCopy(v) else c[k]=v end
+		if k~="motor" and k~="weld" then c[k]=deepCopy(v)
+		else c[k]=v end
 	end
 	return c
 end
-
 local function snapshotAll()
-	local s={}
-	for n,d in pairs(allJointData) do s[n]=deepCopy(d) end
-	return s
+	local s={}; for n,d in pairs(allJointData) do s[n]=deepCopy(d) end; return s
 end
-
 local function pushUndo()
 	table.insert(undoStack,snapshotAll())
 	if #undoStack>50 then table.remove(undoStack,1) end
 	redoStack={}
 end
-
 local function restoreSnapshot(snap)
 	for name,saved in pairs(snap) do
-		if allJointData[name] then
-			saved.motor=allJointData[name].motor
-			saved.weld=allJointData[name].weld
-			allJointData[name]=saved
+		local live = allJointData[name]
+		if live then
+			local restored = deepCopy(saved)
+			restored.motor = live.motor
+			restored.weld = live.weld or (restored.isAccessory and live.motor or nil)
+			allJointData[name] = restored
 		end
 	end
+	if rebuildJointUI then rebuildJointUI() end
 end
-
 local function doUndo()
 	if #undoStack==0 then return end
-	table.insert(redoStack,snapshotAll())
-	restoreSnapshot(table.remove(undoStack))
+	table.insert(redoStack,snapshotAll()); restoreSnapshot(table.remove(undoStack))
 end
 local function doRedo()
 	if #redoStack==0 then return end
-	table.insert(undoStack,snapshotAll())
-	restoreSnapshot(table.remove(redoStack))
+	table.insert(undoStack,snapshotAll()); restoreSnapshot(table.remove(redoStack))
 end
-
 local clipboard=nil
 
 -- ═══════════════════════════════════════════════════════════════════════
---  CODE EXPORT  (zero spaces, compact, paste-ready)
+--  CODE EXPORT
 -- ═══════════════════════════════════════════════════════════════════════
 local function fmtN(n) return fmt("%.16g",n) end
 
-local function sineAxisExpr(base,sa)
-	if sa.amp==0 then return fmtN(base) end
-	local realAmp=sa.reverse and -sa.amp or sa.amp
-	local sign=realAmp>=0 and "+" or "-"
-	local offStr=sa.offset~=0 and ("+"..fmtN(sa.offset)) or ""
-	return fmtN(base)..sign..fmtN(math.abs(realAmp)).."*sin(sine*"..fmtN(sa.speed)..offStr..")"
+local function sineAxisExpr(base, sa)
+	if sa.amp == 0 then return fmtN(base) end
+	local realAmp = sa.reverse and -sa.amp or sa.amp
+	local sign = realAmp >= 0 and "+" or "-"
+	local offset = sa.offset ~= 0 and fmt("+%s", fmtN(sa.offset)) or ""
+	return fmt("%s%s%s*sin(sine*%s%s)", fmtN(base), sign, fmtN(math.abs(realAmp)), fmtN(sa.speed), offset)
+end
+
+local function spinAxisExpr(spinA)
+	if not spinA.enabled then return nil end
+	local direction = spinA.reverse and "-" or "+"
+	return fmt("%smath.fmod(sine*%s,math.pi*2)", direction, fmtN(spinA.speed * 0.05))
 end
 
 local function buildCf(d)
-	local function ax(base,sa)
-		if sa.amp==0 then return fmtN(base) end
-		local r=sa.reverse and -sa.amp or sa.amp
-		local sign=r>=0 and "+" or "-"
-		local off=sa.offset~=0 and ("+"..fmtN(sa.offset)) or ""
-		return fmtN(base)..sign..fmtN(math.abs(r)).."*sin(sine*"..fmtN(sa.speed)..off..")"
+	local function axisExpr(base, sineData, locked)
+		if locked or sineData.amp == 0 then return fmtN(base) end
+		local amp = sineData.reverse and -sineData.amp or sineData.amp
+		local sign = amp >= 0 and "+" or "-"
+		local offset = sineData.offset ~= 0 and fmt("+%s", fmtN(sineData.offset)) or ""
+		return fmt("%s%s%s*sin(sine*%s%s)", fmtN(base), sign, fmtN(math.abs(amp)), fmtN(sineData.speed), offset)
 	end
-	return "cf("..ax(d.posX,d.sinePosX)..","..ax(d.posY,d.sinePosY)..","..ax(d.posZ,d.sinePosZ)..")"
+	return fmt("cf(%s,%s,%s)",
+		axisExpr(d.posX, d.sinePosX, d.lockX),
+		axisExpr(d.posY, d.sinePosY, d.lockY),
+		axisExpr(d.posZ, d.sinePosZ, d.lockZ))
+end
+
+local function buildAngleExpr(base, sineData, spinData, locked)
+	if locked then return fmtN(base) end
+	local expression = sineAxisExpr(base, sineData)
+	local spin = spinAxisExpr(spinData)
+	return spin and ("(" .. expression .. spin .. ")") or expression
 end
 
 local function buildAngles(d)
-	-- Spin is an accumulator at runtime; exported as a large sin expression
-	-- approximation note in the export comment. For export we just output
-	-- the sine part (spin can't be truly exported as it's stateful).
-	local function rot(base,sa)
-		return sineAxisExpr(base,sa)
-	end
-	return "angles("..rot(d.rotX,d.sineX)..","..rot(d.rotY,d.sineY)..","..rot(d.rotZ,d.sineZ)..")"
+	return fmt("angles(%s,%s,%s)",
+		buildAngleExpr(d.rotX, d.sineX, d.spinX, d.lockX),
+		buildAngleExpr(d.rotY, d.sineY, d.spinY, d.lockY),
+		buildAngleExpr(d.rotZ, d.sineZ, d.spinZ, d.lockZ))
 end
 
-local function exportLine(varName,d)
-	return varName..".C0=Lerp("..varName..".C0,cfMul("..buildCf(d)..","..buildAngles(d).."),deltaTime)"
+local function buildSelfAngles(d)
+	return fmt("angles(%s,%s,%s)",
+		buildAngleExpr(d.baseRotX or 0, d.baseSineX, d.baseSpinX, d.lockX),
+		buildAngleExpr(d.baseRotY or 0, d.baseSineY, d.baseSpinY, d.lockY),
+		buildAngleExpr(d.baseRotZ or 0, d.baseSineZ, d.baseSpinZ, d.lockZ))
+end
+
+local function buildSelfPivot(d)
+	return fmt("cf(%s,%s,%s)", fmtN(d.selfPivotX or 0), fmtN(d.selfPivotY or 0), fmtN(d.selfPivotZ or 0))
+end
+
+local function buildInverseSelfPivot(d)
+	return fmt("cf(%s,%s,%s)", fmtN(-(d.selfPivotX or 0)), fmtN(-(d.selfPivotY or 0)), fmtN(-(d.selfPivotZ or 0)))
+end
+
+local function exportLine(varName, d)
+	local normalCF = fmt("cfMul(%s,%s)", buildCf(d), buildAngles(d))
+	local selfCF = buildSelfAngles(d)
+	if d.isAccessory then
+		selfCF = fmt("cfMul(%s,cfMul(%s,%s))", buildSelfPivot(d), selfCF, buildInverseSelfPivot(d))
+	end
+	local target = d.baseRotationFirst
+		and fmt("cfMul(%s,%s)", selfCF, normalCF)
+		or fmt("cfMul(%s,%s)", normalCF, selfCF)
+	return fmt("%s.C0=Lerp(%s.C0,%s,1-(1-0.2)^(deltaTime*60))", varName, varName, target)
 end
 
 local function generateCode()
-	local lines={}
-	for _,name in ipairs(jointOrder) do
-		local d=allJointData[name]
-		if d and d.enabled then table.insert(lines,exportLine(name,d)) end
+	local lines = {}
+	for _, name in ipairs(jointOrder) do
+		local d = allJointData[name]
+		if d and d.enabled then table.insert(lines, exportLine(name, d)) end
 	end
-	return table.concat(lines,"\n")
-end
-
--- ═══════════════════════════════════════════════════════════════════════
---  AXIS LOCK  (world-space counter-rotation)
---
---  How it works:
---    The Motor6D transforms a part relative to its Part0.
---    C0 is the offset from Part0's CFrame to the joint pivot.
---    C1 is the offset from Part1's CFrame to the joint pivot.
---
---    Part1.CFrame = Part0.CFrame * C0 * C1:Inverse()
---
---    To lock an axis in WORLD space, we read Part0's world rotation,
---    extract the rotation we DON'T want (the locked axes), and bake a
---    counter-rotation into C0 that cancels it out.
---
---    Specifically: if the user locks X, we want Part1's world X-rotation
---    to remain at whatever it was when locked. We compute the delta
---    between the current Part0 rotation and the "locked" reference
---    rotation, then subtract that delta from C0's rotation on that axis.
--- ═══════════════════════════════════════════════════════════════════════
-
--- Store the world-space rotation reference when a lock is first enabled.
--- Key: jointName.."_refCF"  → CFrame (world)
-local lockRef = {}
-
-local function getMotorPart0(motor)
-	if not motor then return nil end
-	if motor:IsA("Motor6D") then return motor.Part0
-	elseif motor:IsA("Weld") then return motor.Part0
-	end
-	return nil
+	return table.concat(lines, "\n")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  RUNTIME ANIMATION
 -- ═══════════════════════════════════════════════════════════════════════
-local sine  = 0
-local ALPHA = 0.2
+local sine = 0
+local ALPHA_AT_60_FPS = 0.2
 
-local function evalSineAxis(base,sa)
+local function evalSineAxis(base, sa)
 	if sa.amp==0 then return base end
-	local dir=sa.reverse and -1 or 1
-	return base + sin(sine*sa.speed+sa.offset)*sa.amp*dir
+	local dir = sa.reverse and -1 or 1
+	return base + sin(sine*sa.speed + sa.offset) * sa.amp * dir
 end
 
-local function applyJoint(d,dt)
+local function evalSpinAxis(spA)
+	if not spA.enabled then
+		return 0
+	end
+
+	local dir = spA.reverse and -1 or 1
+
+	-- scaled so entering numbers manually
+	-- doesn't create impossible speeds
+	local speed = spA.speed * 0.05
+
+	return math.fmod(sine * speed, TWO_PI) * dir
+end
+
+local function applyJoint(d, dt)
 	local motor = d.isAccessory and d.weld or d.motor
-	if not motor or not motor.Parent or not d.enabled then return end
-
-	-- Accumulate spin angles (unbounded, per-axis)
-	for _,ax in ipairs({"X","Y","Z"}) do
-		local sp=d["spin"..ax]
-		if sp.enabled then
-			local dir=sp.reverse and -1 or 1
-			sp._angle = sp._angle + sp.speed*dt*dir
-		end
+	if not motor or not motor.Parent then return end
+	if not motor:IsA("Motor6D") and not motor:IsA("Weld") then return end
+	local alpha = 1 - (1 - ALPHA_AT_60_FPS) ^ (math.max(dt, 0) * 60)
+	if not d.enabled then
+		motor.C0 = Lerp(motor.C0, d.restC0, alpha)
+		return
 	end
 
-	-- Build base target position + rotation
-	local px_=evalSineAxis(d.posX,d.sinePosX)
-	local py_=evalSineAxis(d.posY,d.sinePosY)
-	local pz_=evalSineAxis(d.posZ,d.sinePosZ)
+	local px_ = d.lockX and d.posX or evalSineAxis(d.posX, d.sinePosX)
+	local py_ = d.lockY and d.posY or evalSineAxis(d.posY, d.sinePosY)
+	local pz_ = d.lockZ and d.posZ or evalSineAxis(d.posZ, d.sinePosZ)
+	local rx = d.lockX and d.rotX or (evalSineAxis(d.rotX, d.sineX) + evalSpinAxis(d.spinX))
+	local ry = d.lockY and d.rotY or (evalSineAxis(d.rotY, d.sineY) + evalSpinAxis(d.spinY))
+	local rz = d.lockZ and d.rotZ or (evalSineAxis(d.rotZ, d.sineZ) + evalSpinAxis(d.spinZ))
+	local baseRx = d.lockX and (d.baseRotX or 0) or (evalSineAxis(d.baseRotX or 0, d.baseSineX) + evalSpinAxis(d.baseSpinX))
+	local baseRy = d.lockY and (d.baseRotY or 0) or (evalSineAxis(d.baseRotY or 0, d.baseSineY) + evalSpinAxis(d.baseSpinY))
+	local baseRz = d.lockZ and (d.baseRotZ or 0) or (evalSineAxis(d.baseRotZ or 0, d.baseSineZ) + evalSpinAxis(d.baseSpinZ))
 
-	local rx=evalSineAxis(d.rotX,d.sineX)
-	local ry=evalSineAxis(d.rotY,d.sineY)
-	local rz=evalSineAxis(d.rotZ,d.sineZ)
-
-	-- Add spin accumulators
-	rx=rx+d.spinX._angle
-	ry=ry+d.spinY._angle
-	rz=rz+d.spinZ._angle
-
-	local target = cfMul(cf(px_,py_,pz_), angles(rx,ry,rz))
-
-	-- ── AXIS LOCK ────────────────────────────────────────────────────
-	-- If any axis is locked, we apply a counter-rotation in C0 so that
-	-- the limb's world rotation on those axes stays at the locked reference.
-	if d.lockX or d.lockY or d.lockZ then
-		local part0=getMotorPart0(motor)
-		if part0 then
-			local name=d.name
-			-- Capture reference when lock is first toggled on
-			if not lockRef[name] then
-				lockRef[name]=part0.CFrame
-			end
-
-			-- Current Part0 world CFrame (rotation only, no position)
-			local p0Rot = part0.CFrame - part0.CFrame.Position
-
-			-- Reference rotation (when lock was set)
-			local refRot = lockRef[name] - lockRef[name].Position
-
-			-- Delta = how much Part0 has rotated since lock was set
-			-- We want to UNDO this delta on the locked axes.
-			local delta = refRot * p0Rot:Inverse()  -- world-space counter
-
-			-- Extract Euler angles of the delta
-			local dRX,dRY,dRZ = delta:ToEulerAnglesXYZ()
-
-			-- Apply opposing rotation only on locked axes
-			local cX = d.lockX and dRX or 0
-			local cY = d.lockY and dRY or 0
-			local cZ = d.lockZ and dRZ or 0
-
-			-- Bake counter-rotation into the target
-			local counter = angles(cX,cY,cZ)
-			target = cfMul(target, counter)
-		end
-	else
-		-- Clear reference when not locked
-		lockRef[d.name]=nil
+	local baseCF = angles(baseRx, baseRy, baseRz)
+	local animCF = cfMul(cf(px_, py_, pz_), angles(rx, ry, rz))
+	local selfCF = baseCF
+	if d.isAccessory then
+		local pivotCF = cf(d.selfPivotX or 0, d.selfPivotY or 0, d.selfPivotZ or 0)
+		local invPivotCF = cf(-(d.selfPivotX or 0), -(d.selfPivotY or 0), -(d.selfPivotZ or 0))
+		selfCF = cfMul(pivotCF, cfMul(baseCF, invPivotCF))
 	end
 
-	motor.C0 = Lerp(motor.C0, target, ALPHA)
+	local targetCF = d.baseRotationFirst and cfMul(selfCF, animCF) or cfMul(animCF, selfCF)
+	motor.C0 = Lerp(motor.C0, targetCF, alpha)
 end
 
 local rtConn
 local function startRuntime()
 	if rtConn then rtConn:Disconnect() end
-	rtConn=RunService.RenderStepped:Connect(function(dt)
-		sine=sine+dt*60*0.016
-		for _,name in ipairs(jointOrder) do
-			local d=allJointData[name]
-			if d then applyJoint(d,dt) end
+	rtConn = RunService.RenderStepped:Connect(function(dt)
+		sine = sine + dt
+		for _, name in ipairs(jointOrder) do
+			local d = allJointData[name]
+			if d then applyJoint(d, dt) end
 		end
 	end)
 end
 startRuntime()
 
 -- ═══════════════════════════════════════════════════════════════════════
---  GUI SETUP
+--  GUI
 -- ═══════════════════════════════════════════════════════════════════════
-local old=CoreGui:FindFirstChild("CFrameAnimEditor")
+local old = CoreGui:FindFirstChild("CFrameAnimEditor")
 if old then old:Destroy() end
 
-local ScreenGui=Instance.new("ScreenGui")
+local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name="CFrameAnimEditor" ScreenGui.ResetOnSpawn=false
 ScreenGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset=true ScreenGui.DisplayOrder=999
@@ -440,7 +480,6 @@ if not pcall(function() ScreenGui.Parent=CoreGui end) then
 	ScreenGui.Parent=player.PlayerGui
 end
 
--- ── Palette ──────────────────────────────────────────────────────────
 local C={
 	bg=Color3.fromRGB(10,10,14),       panel=Color3.fromRGB(18,18,25),
 	elevated=Color3.fromRGB(26,26,36), border=Color3.fromRGB(40,40,56),
@@ -450,15 +489,14 @@ local C={
 	muted=Color3.fromRGB(105,105,135), white=Color3.fromRGB(255,255,255),
 	code=Color3.fromRGB(120,255,190),  revOn=Color3.fromRGB(248,150,60),
 	axisX=Color3.fromRGB(255,90,90),   axisY=Color3.fromRGB(90,220,90),
-	axisZ=Color3.fromRGB(90,150,255),  subpanel=Color3.fromRGB(22,22,32),
+	axisZ=Color3.fromRGB(90,150,255),
+	subpanel=Color3.fromRGB(22,22,32),
 }
 
--- ── Instance helpers ─────────────────────────────────────────────────
+-- Instance helpers
 local function make(cls,props,parent)
-	local i=Instance.new(cls)
-	for k,v in pairs(props) do i[k]=v end
-	if parent then i.Parent=parent end
-	return i
+	local i=Instance.new(cls); for k,v in pairs(props) do i[k]=v end
+	if parent then i.Parent=parent end; return i
 end
 local function frm(props,parent)
 	props.BackgroundColor3=props.BackgroundColor3 or C.panel
@@ -491,30 +529,27 @@ local function btn(props,parent)
 	return b
 end
 local function crn(r,parent) return make("UICorner",{CornerRadius=ud(0,r)},parent) end
-local function pad(t,b_,l,r,parent)
-	return make("UIPadding",{PaddingTop=ud(0,t),PaddingBottom=ud(0,b_),
+local function pad(t,b,l,r,parent)
+	return make("UIPadding",{PaddingTop=ud(0,t),PaddingBottom=ud(0,b),
 		PaddingLeft=ud(0,l),PaddingRight=ud(0,r)},parent)
 end
 local function strk(col,th,parent) return make("UIStroke",{Color=col,Thickness=th},parent) end
 local function listL(dir,gap,va,parent)
-	return make("UIListLayout",{
-		FillDirection=dir or Enum.FillDirection.Vertical,
-		Padding=ud(0,gap or 3),
-		VerticalAlignment=va or Enum.VerticalAlignment.Top,
-		SortOrder=Enum.SortOrder.LayoutOrder,
-	},parent)
+	return make("UIListLayout",{FillDirection=dir or Enum.FillDirection.Vertical,
+		Padding=ud(0,gap or 3),VerticalAlignment=va or Enum.VerticalAlignment.Top,
+		SortOrder=Enum.SortOrder.LayoutOrder},parent)
 end
 
--- ── Dimensions ───────────────────────────────────────────────────────
+-- Dimensions
 local WIN_W=px(560); local WIN_H=px(660)
 local TITLE_H=px(34); local TOOL_H=px(32)
-local SEARCH_H=px(30); local PRESET_H=px(30)
+local SEARCH_H=px(30); local PRESET_H=px(30); local TAB_H=px(28)
 local CODE_H=px(100)
-local SCROLL_H=WIN_H-TITLE_H-TOOL_H-SEARCH_H-PRESET_H-px(4)-CODE_H
+local SCROLL_H=WIN_H-TITLE_H-TOOL_H-SEARCH_H-PRESET_H-TAB_H-px(6)-CODE_H
 local vp=Camera.ViewportSize
 local WX=math.round(vp.X*0.03); local WY=math.round(vp.Y*0.03)
 
--- ── Main window ───────────────────────────────────────────────────────
+-- Main window
 local Main=frm({Name="Main",Size=UDim2.fromOffset(WIN_W,WIN_H),
 	Position=UDim2.fromOffset(WX,WY),BackgroundColor3=C.bg,ClipsDescendants=true},ScreenGui)
 crn(9,Main); strk(C.border,1.5,Main)
@@ -525,10 +560,10 @@ crn(9,TitleBar)
 frm({Size=UDim2.new(1,0,0,px(9)),Position=UDim2.new(0,0,1,-px(9)),BackgroundColor3=C.panel},TitleBar)
 frm({Size=UDim2.new(0,px(3),1,0),BackgroundColor3=C.accent},TitleBar)
 lbl({Size=UDim2.new(1,-px(116),1,0),Position=UDim2.new(0,px(10),0,0),
-	Text="Lerp Animator",TextColor3=C.white,Font=Enum.Font.GothamBold,TextSize=FS.md,
-	TextXAlignment=Enum.TextXAlignment.Left},TitleBar)
-local vb=frm({Size=UDim2.fromOffset(px(36),px(15)),Position=UDim2.new(1,-px(90),0.5,-px(7)),
-	BackgroundColor3=C.accent2},TitleBar)
+	Text="Lerp Animator",TextColor3=C.white,
+	Font=Enum.Font.GothamBold,TextSize=FS.md,TextXAlignment=Enum.TextXAlignment.Left},TitleBar)
+local vb=frm({Size=UDim2.fromOffset(px(36),px(15)),
+	Position=UDim2.new(1,-px(90),0.5,-px(7)),BackgroundColor3=C.accent2},TitleBar)
 crn(3,vb)
 lbl({Size=UDim2.new(1,0,1,0),Text="v3.1",Font=Enum.Font.GothamBold,
 	TextSize=FS.tiny,TextColor3=C.white,BackgroundTransparency=0},vb)
@@ -554,7 +589,7 @@ do
 	local dragging,ds,sp_
 	TitleBar.InputBegan:Connect(function(inp)
 		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
-			dragging=true; ds=inp.Position; sp_=Main.Position
+			dragging=true ds=inp.Position sp_=Main.Position
 		end
 	end)
 	UserInputService.InputChanged:Connect(function(inp)
@@ -590,16 +625,8 @@ UndoBtn.MouseButton1Click:Connect(doUndo)
 RedoBtn.MouseButton1Click:Connect(doRedo)
 ResetAllBtn.MouseButton1Click:Connect(function()
 	pushUndo()
-	for _,name in ipairs(jointOrder) do
-		local d=allJointData[name]
-		if d then
-			local fresh=makeJointData(d.motor or d.weld)
-			local m=d.motor; local w=d.weld; local ia=d.isAccessory
-			allJointData[name]=fresh
-			allJointData[name].motor=m; allJointData[name].weld=w
-			allJointData[name].isAccessory=ia
-		end
-	end
+	resetAllJointData()
+	rebuildJointUI()
 end)
 
 -- Search
@@ -611,7 +638,7 @@ lbl({Size=UDim2.new(0,px(18),1,0),Position=UDim2.new(0,px(6),0,0),
 	Text="🔍",TextColor3=C.muted,TextSize=FS.sm},SearchRow)
 local SearchInput=make("TextBox",{Size=UDim2.new(1,-px(26),1,0),
 	Position=UDim2.new(0,px(22),0,0),BackgroundTransparency=1,
-	Text="",PlaceholderText="Search joint / accessory...",
+	Text="",PlaceholderText="Search joint / accessory…",
 	Font=Enum.Font.Gotham,TextSize=FS.sm,TextColor3=C.text,
 	PlaceholderColor3=C.muted,ClearTextOnFocus=false},SearchRow)
 
@@ -624,8 +651,18 @@ listL(Enum.FillDirection.Horizontal,px(3),Enum.VerticalAlignment.Center,PresetRo
 lbl({Size=UDim2.new(0,px(50),1,0),Text="Presets:",
 	TextColor3=C.muted,TextSize=FS.tiny,Font=Enum.Font.GothamBold},PresetRow)
 
+-- Body-part tabs
+local TabY=PresetY+PRESET_H
+local TabRow=frm({Size=UDim2.new(1,-px(8),0,TAB_H),Position=UDim2.new(0,px(4),0,TabY),
+	BackgroundColor3=C.panel},Main)
+listL(Enum.FillDirection.Horizontal,px(3),Enum.VerticalAlignment.Center,TabRow)
+pad(px(2),px(2),px(2),px(2),TabRow)
+local TAB_ORDER={"Torso","Head","Arms","Legs","Hats","Other"}
+local activeTab="Torso"
+local TabButtons={}
+
 -- Scroll
-local ScrollY=PresetY+PRESET_H+px(2)
+local ScrollY=TabY+TAB_H+px(2)
 local ScrollFrame=make("ScrollingFrame",{
 	Size=UDim2.new(1,-px(6),0,SCROLL_H),Position=UDim2.new(0,px(3),0,ScrollY),
 	BackgroundColor3=C.bg,BorderSizePixel=0,
@@ -634,6 +671,22 @@ local ScrollFrame=make("ScrollingFrame",{
 	ClipsDescendants=true},Main)
 listL(Enum.FillDirection.Vertical,px(3),Enum.VerticalAlignment.Top,ScrollFrame)
 pad(px(3),px(3),px(3),px(3),ScrollFrame)
+local EmptyTabLabel=lbl({Size=UDim2.new(1,-px(12),0,px(32)),LayoutOrder=0,
+	Text="No editable joints in this tab",TextColor3=C.muted,TextSize=FS.sm,
+	TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center,Visible=false},ScrollFrame)
+
+for _,tabName in ipairs(TAB_ORDER) do
+	local tabButton=btn({Size=UDim2.new(0,0,0,px(21)),AutomaticSize=Enum.AutomaticSize.X,
+		BackgroundColor3=tabName==activeTab and C.accent or C.elevated,
+		Text=" "..tabName.." ",TextSize=FS.tiny,Font=Enum.Font.GothamBold,
+		TextColor3=tabName==activeTab and C.bg or C.muted},TabRow)
+	pad(0,0,px(4),px(4),tabButton); crn(px(4),tabButton)
+	TabButtons[tabName]=tabButton
+	tabButton.MouseButton1Click:Connect(function()
+		activeTab=tabName
+		if rebuildJointUI then rebuildJointUI() end
+	end)
+end
 
 -- Code panel
 local CodeY=WIN_H-CODE_H
@@ -642,18 +695,18 @@ local CodePanel=frm({Size=UDim2.new(1,0,0,CODE_H),
 strk(C.border,1,CodePanel)
 local codeHdr=frm({Size=UDim2.new(1,0,0,px(18)),BackgroundColor3=C.elevated},CodePanel)
 lbl({Size=UDim2.new(1,-px(30),1,0),Position=UDim2.new(0,px(6),0,0),
-	Text="LIVE EXPORT  |  >> freezes  |  copy btn copies",
+	Text="LIVE EXPORT  ·  ⬡ freezes  ·  ⎘ copies",
 	TextColor3=C.muted,TextSize=FS.tiny,Font=Enum.Font.GothamBold,
 	TextXAlignment=Enum.TextXAlignment.Left},codeHdr)
 local CopyBtn=btn({Size=UDim2.fromOffset(px(24),px(14)),
 	Position=UDim2.new(1,-px(26),0.5,-px(7)),
-	BackgroundColor3=C.accent,Text="CP",TextSize=FS.tiny,TextColor3=C.bg},codeHdr)
+	BackgroundColor3=C.accent,Text="⎘",TextSize=FS.tiny,TextColor3=C.bg},codeHdr)
 crn(3,CopyBtn)
-local CodeLabel=lbl({Size=UDim2.new(1,-px(8),1,-px(22)),
-	Position=UDim2.new(0,px(4),0,px(20)),
-	Text="-- initialising...",TextColor3=C.code,Font=Enum.Font.Code,TextSize=FS.tiny,
+local CodeLabel=make("TextBox",{Size=UDim2.new(1,-px(8),1,-px(22)),
+	Position=UDim2.new(0,px(4),0,px(20)),BackgroundTransparency=1,BorderSizePixel=0,
+	Text="-- initialising…",PlaceholderText="",TextColor3=C.code,Font=Enum.Font.Code,TextSize=FS.tiny,
 	TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
-	TextWrapped=true},CodePanel)
+	TextWrapped=true,MultiLine=true,ClearTextOnFocus=false,TextEditable=false},CodePanel)
 
 CopyBtn.MouseButton1Click:Connect(function()
 	local code=generateCode()
@@ -664,17 +717,38 @@ CopyBtn.MouseButton1Click:Connect(function()
 		local tb=Instance.new("TextBox")
 		tb.Parent=ScreenGui tb.Size=UDim2.fromOffset(1,1)
 		tb.Position=UDim2.new(2,0,2,0) tb.Text=code
-		tb:CaptureFocus()
-		task.delay(0.05,function() tb:ReleaseFocus() tb:Destroy() end)
+		tb:CaptureFocus(); task.delay(0.05,function() tb:ReleaseFocus() tb:Destroy() end)
 	end
-	CopyBtn.Text="OK"; task.delay(1.5,function() CopyBtn.Text="CP" end)
+	CopyBtn.Text="✓"; task.delay(1.5,function() CopyBtn.Text="⎘" end)
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════
---  WIDGETS
+--  REUSABLE WIDGETS
 -- ═══════════════════════════════════════════════════════════════════════
 
--- Slider (typed bypasses limits)
+-- Slider input uses one shared pair of global input connections to keep
+-- event cost stable as the editor adds more joints and controls.
+local activeSlider=nil
+UserInputService.InputChanged:Connect(function(inp)
+	if not activeSlider or inp.UserInputType~=Enum.UserInputType.MouseMovement then return end
+	local track=activeSlider.track
+	if not track or not track.Parent then activeSlider=nil; return end
+	local ap,as=track.AbsolutePosition,track.AbsoluteSize
+	if as.X<=0 then return end
+	local t=math.clamp((inp.Position.X-ap.X)/as.X,0,1)
+	activeSlider.setVal(activeSlider.min+t*activeSlider.range,true)
+end)
+UserInputService.InputEnded:Connect(function(inp)
+	if inp.UserInputType==Enum.UserInputType.MouseButton1 then activeSlider=nil end
+end)
+
+local MAX_TYPED_VALUE=10000
+local function isSafeNumber(value)
+	return type(value)=="number" and value==value and value~=math.huge and value~=-math.huge
+		and math.abs(value)<=MAX_TYPED_VALUE
+end
+
+-- Typed values may exceed slider limits, but remain bounded and validated.
 local function makeSliderRow(parent,labelTxt,sMin,sMax,initV,onChange,lo)
 	local row=frm({Size=UDim2.new(1,-px(6),0,px(22)),
 		BackgroundTransparency=1,LayoutOrder=lo},parent)
@@ -697,33 +771,34 @@ local function makeSliderRow(parent,labelTxt,sMin,sMax,initV,onChange,lo)
 		Text=fmt("%.3f",initV),Font=Enum.Font.Code,
 		TextSize=FS.tiny,TextColor3=C.accent,ClearTextOnFocus=true},row)
 	crn(px(3),numBox)
-	local function setVal(v,clampSlider)
-		local dv=clampSlider and math.clamp(v,sMin,sMax) or v
-		local t=math.clamp((dv-sMin)/range,0,1)
+
+	local currentValue=initV
+	local function setVal(v, clampSlider)
+		if not isSafeNumber(v) then return end
+		local displayValue=clampSlider and math.clamp(v,sMin,sMax) or v
+		local t=math.clamp((displayValue-sMin)/range,0,1)
 		fill.Size=UDim2.new(t,0,1,0)
 		thumb.Position=UDim2.new(t,-px(5),0.5,-px(5))
+		currentValue=v
 		numBox.Text=fmt("%.3f",v)
 		onChange(v)
 	end
-	local drag=false
+
 	track.InputBegan:Connect(function(inp)
 		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
-			drag=true
-			local ap=track.AbsolutePosition; local as=track.AbsoluteSize
-			setVal(sMin+math.clamp((inp.Position.X-ap.X)/as.X,0,1)*range,true)
+			pushUndo()
+			activeSlider={track=track,min=sMin,range=range,setVal=setVal}
+			local ap,as=track.AbsolutePosition,track.AbsoluteSize
+			if as.X>0 then setVal(sMin+math.clamp((inp.Position.X-ap.X)/as.X,0,1)*range,true) end
 		end
-	end)
-	UserInputService.InputChanged:Connect(function(inp)
-		if drag and inp.UserInputType==Enum.UserInputType.MouseMovement then
-			local ap=track.AbsolutePosition; local as=track.AbsoluteSize
-			setVal(sMin+math.clamp((inp.Position.X-ap.X)/as.X,0,1)*range,true)
-		end
-	end)
-	UserInputService.InputEnded:Connect(function(inp)
-		if inp.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end
 	end)
 	numBox.FocusLost:Connect(function()
-		local v=tonumber(numBox.Text); if v then pushUndo(); setVal(v,false) end
+		local v=tonumber(numBox.Text)
+		if isSafeNumber(v) then
+			pushUndo(); setVal(v,false)
+		else
+			numBox.Text=fmt("%.3f",currentValue)
+		end
 	end)
 	return row,setVal
 end
@@ -751,13 +826,14 @@ local function makeToggle(parent,labelTxt,initState,onChange,lo)
 	end
 	trk.InputBegan:Connect(function(inp)
 		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
+			pushUndo()
 			state=not state; setState(state); onChange(state)
 		end
 	end)
 	return row,setState
 end
 
--- Pill button
+-- Small pill toggle button (for Reverse)
 local function makePill(parent,txt,initState,activeCol,onChange,lo)
 	local row=frm({Size=UDim2.new(1,-px(6),0,px(20)),BackgroundTransparency=1,LayoutOrder=lo},parent)
 	lbl({Size=UDim2.new(0,px(68),1,0),Text=txt,
@@ -777,11 +853,14 @@ local function makePill(parent,txt,initState,activeCol,onChange,lo)
 		b.Text=v and "ON" or "OFF"
 		b.TextColor3=v and C.bg or C.muted
 	end
-	b.MouseButton1Click:Connect(function() state=not state; setState(state); onChange(state) end)
+	b.MouseButton1Click:Connect(function()
+		pushUndo()
+		state=not state; setState(state); onChange(state)
+	end)
 	return row,setState
 end
 
--- Sep label
+-- Section separator
 local function makeSep(parent,txt,lo)
 	local s=frm({Size=UDim2.new(1,-px(6),0,px(12)),BackgroundTransparency=1,LayoutOrder=lo},parent)
 	lbl({Size=UDim2.new(1,0,1,0),Text=txt,TextColor3=Color3.fromRGB(55,55,78),
@@ -790,108 +869,117 @@ local function makeSep(parent,txt,lo)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
---  PER-AXIS COLLAPSIBLE BLOCKS
---  IMPORTANT: layout order inside the PARENT (ScrollFrame body) must be
---  unique integers. We use a shared counter passed in and returned.
+--  PER-AXIS SINE BLOCK
+--  Builds a collapsible sub-panel for one axis's sine settings.
+--  axisColor: tint colour for the axis label
+--  Returns setters table { amp, speed, offset }
 -- ═══════════════════════════════════════════════════════════════════════
+local function makeAxisSineBlock(parent, axisLabel, axisColor, sineTable, lo)
+	local collapsed = true  -- start collapsed to save space
 
--- Returns updated lo counter
-local function makeAxisSineBlock(parent,axisLabel,axisColor,sineTable,lo)
-	local collapsed=true
-
-	-- header sits directly in parent with LayoutOrder=lo
-	local header=frm({Size=UDim2.new(1,-px(6),0,px(18)),
+	local header = frm({Size=UDim2.new(1,-px(6),0,px(18)),
 		BackgroundColor3=C.subpanel,LayoutOrder=lo},parent)
 	crn(px(4),header)
-	local arrowL=lbl({Size=UDim2.fromOffset(px(12),px(18)),Position=UDim2.new(0,px(3),0,0),
-		Text=">>",TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold},header)
-	lbl({Size=UDim2.new(1,-px(20),1,0),Position=UDim2.new(0,px(16),0,0),
+
+	local arrowL = lbl({Size=UDim2.fromOffset(px(12),px(18)),Position=UDim2.new(0,px(3),0,0),
+		Text="▶",TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold},header)
+	lbl({Size=UDim2.new(1,-px(20),1,0),Position=UDim2.new(0,px(14),0,0),
 		Text="Axis "..axisLabel,TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold,
 		TextXAlignment=Enum.TextXAlignment.Left},header)
 
-	lo=lo+1
-	-- body sits in parent with LayoutOrder=lo (immediately after header)
-	local body=frm({Size=UDim2.new(1,-px(6),0,0),AutomaticSize=Enum.AutomaticSize.Y,
-		BackgroundColor3=C.subpanel,LayoutOrder=lo,Visible=false},parent)
+	local body = frm({Size=UDim2.new(1,-px(6),0,0),AutomaticSize=Enum.AutomaticSize.Y,
+		BackgroundColor3=C.subpanel,LayoutOrder=lo+0.5,Visible=false},parent)
 	crn(px(4),body)
 	listL(Enum.FillDirection.Vertical,px(2),Enum.VerticalAlignment.Top,body)
-	pad(px(4),px(4),px(8),px(4),body)
+	pad(px(4),px(4),px(6),px(4),body)
 
 	header.InputBegan:Connect(function(inp)
 		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
 			collapsed=not collapsed
 			body.Visible=not collapsed
-			arrowL.Text=collapsed and ">>" or "vv"
+			arrowL.Text=collapsed and "▶" or "▼"
 		end
 	end)
 
-	local inner=0
-	local function ni() inner=inner+1; return inner end
-	makeSliderRow(body,"Amp",-TWO_PI,TWO_PI,sineTable.amp,function(v) sineTable.amp=v end,ni())
-	makeSliderRow(body,"Speed",0.1,20,sineTable.speed,function(v) sineTable.speed=v end,ni())
-	makeSliderRow(body,"Offset",-TWO_PI,TWO_PI,sineTable.offset,function(v) sineTable.offset=v end,ni())
-	makePill(body,"Reverse",sineTable.reverse,C.revOn,function(v) sineTable.reverse=v end,ni())
+	local lo2=1
+	local function nlo2() lo2=lo2+1; return lo2 end
 
-	return lo  -- caller increments beyond this
+	local _,setAmp    = makeSliderRow(body,"Amp",   -TWO_PI,TWO_PI, sineTable.amp,    function(v) sineTable.amp=v    end,nlo2())
+	local _,setSpeed  = makeSliderRow(body,"Speed",  0.1,    20,     sineTable.speed,  function(v) sineTable.speed=v  end,nlo2())
+	local _,setOffset = makeSliderRow(body,"Offset", -TWO_PI,TWO_PI, sineTable.offset, function(v) sineTable.offset=v end,nlo2())
+	makePill(body,"Reverse",sineTable.reverse,C.revOn,function(v) sineTable.reverse=v end,nlo2())
+
+	return { setAmp=setAmp, setSpeed=setSpeed, setOffset=setOffset }
 end
 
-local function makeAxisSpinBlock(parent,axisLabel,axisColor,spinTable,lo)
-	local collapsed=true
+-- ═══════════════════════════════════════════════════════════════════════
+--  PER-AXIS SPIN BLOCK (continuous)
+-- ═══════════════════════════════════════════════════════════════════════
+local function makeAxisSpinBlock(parent, axisLabel, axisColor, spinTable, lo)
+	local collapsed = true
 
-	local header=frm({Size=UDim2.new(1,-px(6),0,px(18)),
+	local header = frm({Size=UDim2.new(1,-px(6),0,px(18)),
 		BackgroundColor3=C.subpanel,LayoutOrder=lo},parent)
 	crn(px(4),header)
-	local arrowL=lbl({Size=UDim2.fromOffset(px(12),px(18)),Position=UDim2.new(0,px(3),0,0),
-		Text=">>",TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold},header)
-	lbl({Size=UDim2.new(1,-px(20),1,0),Position=UDim2.new(0,px(16),0,0),
-		Text="Spin "..axisLabel.." (inf)",TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold,
+
+	local arrowL = lbl({Size=UDim2.fromOffset(px(12),px(18)),Position=UDim2.new(0,px(3),0,0),
+		Text="▶",TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold},header)
+	lbl({Size=UDim2.new(1,-px(20),1,0),Position=UDim2.new(0,px(14),0,0),
+		Text="Axis "..axisLabel.."  (infinite)",TextColor3=axisColor,TextSize=FS.tiny,Font=Enum.Font.GothamBold,
 		TextXAlignment=Enum.TextXAlignment.Left},header)
 
-	lo=lo+1
-	local body=frm({Size=UDim2.new(1,-px(6),0,0),AutomaticSize=Enum.AutomaticSize.Y,
-		BackgroundColor3=C.subpanel,LayoutOrder=lo,Visible=false},parent)
+	local body = frm({Size=UDim2.new(1,-px(6),0,0),AutomaticSize=Enum.AutomaticSize.Y,
+		BackgroundColor3=C.subpanel,LayoutOrder=lo+0.5,Visible=false},parent)
 	crn(px(4),body)
 	listL(Enum.FillDirection.Vertical,px(2),Enum.VerticalAlignment.Top,body)
-	pad(px(4),px(4),px(8),px(4),body)
+	pad(px(4),px(4),px(6),px(4),body)
 
 	header.InputBegan:Connect(function(inp)
 		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
 			collapsed=not collapsed
 			body.Visible=not collapsed
-			arrowL.Text=collapsed and ">>" or "vv"
+			arrowL.Text=collapsed and "▶" or "▼"
 		end
 	end)
 
-	local inner=0
-	local function ni() inner=inner+1; return inner end
-	makeToggle(body,"Enabled",spinTable.enabled,function(v)
-		spinTable.enabled=v
-		if not v then spinTable._angle=0 end
-	end,ni())
-	makeSliderRow(body,"Speed",0.1,20,spinTable.speed,function(v) spinTable.speed=v end,ni())
-	makePill(body,"Reverse",spinTable.reverse,C.revOn,function(v) spinTable.reverse=v end,ni())
+	local lo2=1
+	local function nlo2() lo2=lo2+1; return lo2 end
 
-	return lo
+	makeToggle(body,"Enabled",spinTable.enabled,function(v) spinTable.enabled=v end,nlo2())
+	local _,setSpeed = makeSliderRow(body,"Speed",0.1,20,spinTable.speed,function(v) spinTable.speed=v end,nlo2())
+	makePill(body,"Reverse",spinTable.reverse,C.revOn,function(v) spinTable.reverse=v end,nlo2())
+
+	return { setSpeed=setSpeed }
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
---  JOINT SECTION BUILDER
+--  MAIN JOINT SECTION BUILDER
 -- ═══════════════════════════════════════════════════════════════════════
 local jointSections={}
+local expandedSections={}
 local loCount=0
 local function nlo() loCount=loCount+1; return loCount end
 
-local function buildJointSection(name,d,parentFrame)
-	local dispName=d.isAccessory and ("Hat: "..name) or (DISPLAY_NAMES[name] or ("+ "..name))
-	local sectionCollapsed=false
+local AXIS_COLORS = { X=C.axisX, Y=C.axisY, Z=C.axisZ }
+local categoryForJoint
 
-	local headerLO=nlo()
+local function buildJointSection(name,d,parentFrame)
+	local dispName
+	if d.isAccessory then
+		dispName = "🎩 "..name
+	else
+		dispName = DISPLAY_NAMES[name] or ("✦ "..name)
+	end
+
+	local category=categoryForJoint(name,d)
+	local sectionEntry={category=category,displayName=dispName,expanded=expandedSections[name]~=false}
+
 	local header=frm({Size=UDim2.new(1,-px(6),0,px(28)),
-		BackgroundColor3=C.elevated,LayoutOrder=headerLO},parentFrame)
+		BackgroundColor3=C.elevated,LayoutOrder=nlo()},parentFrame)
 	crn(px(5),header); strk(C.border,1,header)
 
 	local arrowL=lbl({Size=UDim2.fromOffset(px(16),px(28)),Position=UDim2.new(0,px(5),0,0),
-		Text="v",TextColor3=C.accent,TextSize=FS.tiny,Font=Enum.Font.GothamBold},header)
+		Text="▼",TextColor3=C.accent,TextSize=FS.tiny,Font=Enum.Font.GothamBold},header)
 	lbl({Size=UDim2.new(1,-px(60),1,0),Position=UDim2.new(0,px(22),0,0),
 		Text=dispName,TextColor3=C.text,TextSize=FS.sm,Font=Enum.Font.GothamBold,
 		TextXAlignment=Enum.TextXAlignment.Left},header)
@@ -903,101 +991,137 @@ local function buildJointSection(name,d,parentFrame)
 		TextColor3=d.enabled and C.green or C.muted},header)
 	crn(px(3),enBtn)
 	enBtn.MouseButton1Click:Connect(function()
+		pushUndo()
 		d.enabled=not d.enabled
 		enBtn.BackgroundColor3=d.enabled and Color3.fromRGB(16,50,38) or C.elevated
 		enBtn.Text=d.enabled and "ON" or "OFF"
 		enBtn.TextColor3=d.enabled and C.green or C.muted
 	end)
 
-	local bodyLO=nlo()
 	local body=frm({Size=UDim2.new(1,-px(6),0,0),AutomaticSize=Enum.AutomaticSize.Y,
-		BackgroundColor3=C.panel,LayoutOrder=bodyLO},parentFrame)
+		BackgroundColor3=C.panel,LayoutOrder=nlo()},parentFrame)
 	crn(px(5),body)
 	listL(Enum.FillDirection.Vertical,px(2),Enum.VerticalAlignment.Top,body)
 	pad(px(5),px(6),px(5),px(5),body)
 
 	header.InputBegan:Connect(function(inp)
 		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
-			sectionCollapsed=not sectionCollapsed
-			body.Visible=not sectionCollapsed
-			arrowL.Text=sectionCollapsed and ">" or "v"
+			sectionEntry.expanded=not sectionEntry.expanded
+			expandedSections[name]=sectionEntry.expanded
+			body.Visible=sectionEntry.expanded and header.Visible
+			arrowL.Text=sectionEntry.expanded and "▼" or "▶"
 		end
 	end)
 
-	-- We use a local counter for the body's children LayoutOrder
-	local blo=0
-	local function bl() blo=blo+1; return blo end
+	-- ── BASE POSITION ─────────────────────────────────────────────
+	makeSep(body,"──  BASE POSITION",nlo())
+	local _,setPX=makeSliderRow(body,"Pos X",-5,5,d.posX,function(v) d.posX=v end,nlo())
+	local _,setPY=makeSliderRow(body,"Pos Y",-5,5,d.posY,function(v) d.posY=v end,nlo())
+	local _,setPZ=makeSliderRow(body,"Pos Z",-5,5,d.posZ,function(v) d.posZ=v end,nlo())
 
-	-- BASE POSITION
-	makeSep(body,"-- BASE POSITION",bl())
-	local _,setPX=makeSliderRow(body,"Pos X",-5,5,d.posX,function(v) d.posX=v end,bl())
-	local _,setPY=makeSliderRow(body,"Pos Y",-5,5,d.posY,function(v) d.posY=v end,bl())
-	local _,setPZ=makeSliderRow(body,"Pos Z",-5,5,d.posZ,function(v) d.posZ=v end,bl())
+	-- ── BASE ROTATION ─────────────────────────────────────────────
+	makeSep(body,"──  BASE ROTATION  (radians)",nlo())
+	local _,setRX=makeSliderRow(body,"Rot X",-TWO_PI,TWO_PI,d.rotX,function(v) d.rotX=v end,nlo())
+	local _,setRY=makeSliderRow(body,"Rot Y",-TWO_PI,TWO_PI,d.rotY,function(v) d.rotY=v end,nlo())
+	local _,setRZ=makeSliderRow(body,"Rot Z",-TWO_PI,TWO_PI,d.rotZ,function(v) d.rotZ=v end,nlo())
+	-- ── SELF ROTATION ─────────────────────────────────────────────
+	makeSep(body,"──  SELF ROTATION  (rotates object around itself)",nlo())
 
-	-- BASE ROTATION
-	makeSep(body,"-- BASE ROTATION (radians)",bl())
-	local _,setRX=makeSliderRow(body,"Rot X",-TWO_PI,TWO_PI,d.rotX,function(v) d.rotX=v end,bl())
-	local _,setRY=makeSliderRow(body,"Rot Y",-TWO_PI,TWO_PI,d.rotY,function(v) d.rotY=v end,bl())
-	local _,setRZ=makeSliderRow(body,"Rot Z",-TWO_PI,TWO_PI,d.rotZ,function(v) d.rotZ=v end,bl())
+		makeToggle(
+			body,
+			"Base Rotation First",
+			d.baseRotationFirst,
+			function(v)
+				d.baseRotationFirst = v
+			end,
+			nlo()
+		)
 
-	-- SINE ROTATION per axis (each header+body pair increments blo by 2)
-	makeSep(body,"-- SINE ROTATION (click axis to expand)",bl())
-	local lo_=bl(); lo_=makeAxisSineBlock(body,"X",C.axisX,d.sineX,lo_); blo=lo_
-	lo_=bl(); lo_=makeAxisSineBlock(body,"Y",C.axisY,d.sineY,lo_); blo=lo_
-	lo_=bl(); lo_=makeAxisSineBlock(body,"Z",C.axisZ,d.sineZ,lo_); blo=lo_
+	local _,setBRX = makeSliderRow(
+		body,
+		"Self Rot X",
+		-TWO_PI,
+		TWO_PI,
+		d.baseRotX,
+		function(v) d.baseRotX = v end,
+		nlo()
+	)
 
-	-- SINE POSITION per axis
-	makeSep(body,"-- SINE POSITION (click axis to expand)",bl())
-	lo_=bl(); lo_=makeAxisSineBlock(body,"X",C.axisX,d.sinePosX,lo_); blo=lo_
-	lo_=bl(); lo_=makeAxisSineBlock(body,"Y",C.axisY,d.sinePosY,lo_); blo=lo_
-	lo_=bl(); lo_=makeAxisSineBlock(body,"Z",C.axisZ,d.sinePosZ,lo_); blo=lo_
+	local _,setBRY = makeSliderRow(
+		body,
+		"Self Rot Y",
+		-TWO_PI,
+		TWO_PI,
+		d.baseRotY,
+		function(v) d.baseRotY = v end,
+		nlo()
+	)
 
-	-- INFINITE SPIN per axis
-	makeSep(body,"-- INFINITE SPIN (click axis to expand)",bl())
-	lo_=bl(); lo_=makeAxisSpinBlock(body,"X",C.axisX,d.spinX,lo_); blo=lo_
-	lo_=bl(); lo_=makeAxisSpinBlock(body,"Y",C.axisY,d.spinY,lo_); blo=lo_
-	lo_=bl(); lo_=makeAxisSpinBlock(body,"Z",C.axisZ,d.spinZ,lo_); blo=lo_
+	local _,setBRZ = makeSliderRow(
+		body,
+		"Self Rot Z",
+		-TWO_PI,
+		TWO_PI,
+		d.baseRotZ,
+		function(v) d.baseRotZ = v end,
+		nlo()
+	)
 
-	-- AXIS LOCK
-	-- When toggled, captures Part0's world CFrame as the reference.
-	-- Each frame the runtime applies an opposing rotation to cancel Part0's movement on those axes.
-	makeSep(body,"-- AXIS LOCK (world-space counter-rotation)",bl())
-	local lockRow=frm({Size=UDim2.new(1,-px(6),0,px(26)),
-		BackgroundTransparency=1,LayoutOrder=bl()},body)
+	-- optional but matches your system style
+	makeSep(body,"──  SELF ROTATION SINE",nlo())
+	makeAxisSineBlock(body,"X",C.axisX,d.baseSineX,nlo())
+	makeAxisSineBlock(body,"Y",C.axisY,d.baseSineY,nlo())
+	makeAxisSineBlock(body,"Z",C.axisZ,d.baseSineZ,nlo())
 
-	-- Info label
-	lbl({Size=UDim2.new(1,0,0,px(11)),Position=UDim2.new(0,0,0,0),
-		Text="Locks world-axis orientation. Toggle resets reference.",
-		TextColor3=C.muted,TextSize=math.max(6,FS.tiny-2),Font=Enum.Font.Gotham,
+	makeSep(body,"──  SELF ROTATION SPIN",nlo())
+	makeAxisSpinBlock(body,"X",C.axisX,d.baseSpinX,nlo())
+	makeAxisSpinBlock(body,"Y",C.axisY,d.baseSpinY,nlo())
+	makeAxisSpinBlock(body,"Z",C.axisZ,d.baseSpinZ,nlo())
+
+
+	-- ── SINE ROTATION per axis ────────────────────────────────────
+	makeSep(body,"──  SINE ROTATION  (per axis, click to expand)",nlo())
+	makeAxisSineBlock(body,"X",C.axisX,d.sineX,nlo())
+	makeAxisSineBlock(body,"Y",C.axisY,d.sineY,nlo())
+	makeAxisSineBlock(body,"Z",C.axisZ,d.sineZ,nlo())
+
+	-- ── SINE POSITION per axis ────────────────────────────────────
+	makeSep(body,"──  SINE POSITION  (per axis, click to expand)",nlo())
+	makeAxisSineBlock(body,"X",C.axisX,d.sinePosX,nlo())
+	makeAxisSineBlock(body,"Y",C.axisY,d.sinePosY,nlo())
+	makeAxisSineBlock(body,"Z",C.axisZ,d.sinePosZ,nlo())
+
+	-- ── CONTINUOUS SPIN per axis ─────────────────────────────────────────
+	makeSep(body,"──  INFINITE SPIN  (per axis, click to expand)",nlo())
+	makeAxisSpinBlock(body,"X",C.axisX,d.spinX,nlo())
+	makeAxisSpinBlock(body,"Y",C.axisY,d.spinY,nlo())
+	makeAxisSpinBlock(body,"Z",C.axisZ,d.spinZ,nlo())
+
+	-- ── AXIS LOCK ─────────────────────────────────────────────────
+	makeSep(body,"──  AXIS LOCK",nlo())
+	local lockRow=frm({Size=UDim2.new(1,-px(6),0,px(22)),
+		BackgroundTransparency=1,LayoutOrder=nlo()},body)
+	lbl({Size=UDim2.new(0,px(68),1,0),Text="Lock Axis",
+		TextColor3=C.muted,TextSize=FS.tiny,Font=Enum.Font.Gotham,
 		TextXAlignment=Enum.TextXAlignment.Left},lockRow)
-
-	local btnRow=frm({Size=UDim2.new(1,-px(6),0,px(18)),Position=UDim2.new(0,0,1,-px(18)),
-		BackgroundTransparency=1},lockRow)
-
 	for i,ax in ipairs({"X","Y","Z"}) do
-		local axCol={X=C.axisX,Y=C.axisY,Z=C.axisZ}[ax]
-		local isLocked=d["lock"..ax]
-		local b=btn({Size=UDim2.fromOffset(px(52),px(16)),
-			Position=UDim2.new(0,(i-1)*px(56),0,0),
-			BackgroundColor3=isLocked and C.warn or C.elevated,
-			Text=ax..(isLocked and " [ON]" or " [OFF]"),
-			TextSize=FS.tiny,Font=Enum.Font.GothamBold,
-			TextColor3=isLocked and C.bg or axCol},btnRow)
+		local axCol=AXIS_COLORS[ax]
+		local b=btn({Size=UDim2.fromOffset(px(34),px(18)),
+			Position=UDim2.new(0,px(70)+(i-1)*px(38),0.5,-px(9)),
+			BackgroundColor3=d["lock"..ax] and C.warn or C.elevated,
+			Text=ax.." 🔒",TextSize=FS.tiny,TextColor3=axCol},lockRow)
 		crn(px(3),b)
 		b.MouseButton1Click:Connect(function()
+			pushUndo()
 			d["lock"..ax]=not d["lock"..ax]
 			b.BackgroundColor3=d["lock"..ax] and C.warn or C.elevated
-			b.Text=ax..(d["lock"..ax] and " [ON]" or " [OFF]")
-			b.TextColor3=d["lock"..ax] and C.bg or axCol
-			-- Reset the reference so it re-captures current orientation
-			lockRef[name]=nil
 		end)
 	end
 
-	-- ACTIONS
-	makeSep(body,"-- ACTIONS",bl())
+	-- ── ACTIONS ───────────────────────────────────────────────────
+	makeSep(body,"──  ACTIONS",nlo())
 	local actRow=frm({Size=UDim2.new(1,-px(6),0,px(24)),
-		BackgroundTransparency=1,LayoutOrder=bl()},body)
+		BackgroundTransparency=1,LayoutOrder=nlo()},body)
 	listL(Enum.FillDirection.Horizontal,px(4),Enum.VerticalAlignment.Center,actRow)
 	local function aBtn(txt,bgCol,txCol)
 		local b=btn({Size=UDim2.new(0,0,0,px(20)),AutomaticSize=Enum.AutomaticSize.X,
@@ -1006,86 +1130,221 @@ local function buildJointSection(name,d,parentFrame)
 		pad(0,0,px(5),px(5),b); crn(px(3),b); return b
 	end
 
-	local resetBtn=aBtn("Reset")
-	local copyBtn =aBtn("Copy")
-	local pasteBtn=aBtn("Paste")
+	local resetBtn=aBtn("⟳ Reset")
+	local copyBtn =aBtn("⎘ Copy")
+	local pasteBtn=aBtn("⎗ Paste")
 
 	if MIRROR_MAP[name] then
-		local mBtn=aBtn("Mirror",Color3.fromRGB(20,24,52),C.accent2)
+		local mBtn=aBtn("↔ Mirror",Color3.fromRGB(20,24,52),C.accent2)
 		mBtn.MouseButton1Click:Connect(function()
-			pushUndo()
 			local o=allJointData[MIRROR_MAP[name]]
-			if o then
-				o.posX=-d.posX; o.posY=d.posY; o.posZ=d.posZ
-				o.rotX=d.rotX;  o.rotY=-d.rotY; o.rotZ=-d.rotZ
-				for _,ax in ipairs({"X","Y","Z"}) do
-					o["sine"..ax].amp=d["sine"..ax].amp
-					o["sine"..ax].speed=d["sine"..ax].speed
-					o["sine"..ax].offset=d["sine"..ax].offset
-					o["sine"..ax].reverse=(ax=="X") and not d["sine"..ax].reverse or d["sine"..ax].reverse
+			if not o then return end
+			pushUndo()
+			o.posX,o.posY,o.posZ=-d.posX,d.posY,d.posZ
+			o.rotX,o.rotY,o.rotZ=d.rotX,-d.rotY,-d.rotZ
+			o.baseRotX,o.baseRotY,o.baseRotZ=d.baseRotX,-d.baseRotY,-d.baseRotZ
+			o.selfPivotX,o.selfPivotY,o.selfPivotZ=-(d.selfPivotX or 0),d.selfPivotY,d.selfPivotZ
+			o.baseRotationFirst=d.baseRotationFirst
+			for _,axis in ipairs({"X","Y","Z"}) do
+				local positionFlip=axis=="X"
+				local rotationFlip=axis~="X"
+				local function mirrorSine(source,target,flip)
+					target.amp=source.amp; target.speed=source.speed; target.offset=source.offset
+					target.reverse=source.reverse~=(flip==true)
 				end
+				local function mirrorSpin(source,target,flip)
+					target.enabled=source.enabled; target.speed=source.speed
+					target.reverse=source.reverse~=(flip==true)
+				end
+				mirrorSine(d["sinePos"..axis],o["sinePos"..axis],positionFlip)
+				mirrorSine(d["sine"..axis],o["sine"..axis],rotationFlip)
+				mirrorSine(d["baseSine"..axis],o["baseSine"..axis],rotationFlip)
+				mirrorSpin(d["spin"..axis],o["spin"..axis],rotationFlip)
+				mirrorSpin(d["baseSpin"..axis],o["baseSpin"..axis],rotationFlip)
+				o["lock"..axis]=d["lock"..axis]
 			end
+			rebuildJointUI()
 		end)
 	end
 
 	local function doReset()
 		pushUndo()
-		local motor=d.motor or d.weld
-		local fresh=makeJointData(motor)
-		for k,v in pairs(fresh) do
-			if k~="motor" and k~="weld" and k~="name" and k~="isAccessory" then d[k]=v end
-		end
-		lockRef[name]=nil
-		setPX(d.posX,false); setPY(d.posY,false); setPZ(d.posZ,false)
-		setRX(d.rotX,false); setRY(d.rotY,false); setRZ(d.rotZ,false)
+		resetJointData(d)
+		rebuildJointUI()
 	end
 	resetBtn.MouseButton1Click:Connect(doReset)
 	copyBtn.MouseButton1Click:Connect(function() clipboard=deepCopy(d) end)
 	pasteBtn.MouseButton1Click:Connect(function()
 		if not clipboard then return end
 		pushUndo()
+		local structural={motor=true,weld=true,name=true,restC0=true,isAccessory=true,accessoryName=true,
+			restSelfPivotX=true,restSelfPivotY=true,restSelfPivotZ=true,
+			selfPivotX=true,selfPivotY=true,selfPivotZ=true}
 		for k,v in pairs(clipboard) do
-			if k~="motor" and k~="weld" and k~="name" and k~="isAccessory" then d[k]=deepCopy(v) end
+			if not structural[k] then d[k]=deepCopy(v) end
 		end
-		lockRef[name]=nil
-		setPX(d.posX,false); setPY(d.posY,false); setPZ(d.posZ,false)
-		setRX(d.rotX,false); setRY(d.rotY,false); setRZ(d.rotZ,false)
+		rebuildJointUI()
 	end)
 
-	jointSections[name]={header=header,body=body}
+	sectionEntry.header=header
+	sectionEntry.body=body
+	jointSections[name]=sectionEntry
 end
 
-for _,name in ipairs(jointOrder) do
-	local d=allJointData[name]; if d then buildJointSection(name,d,ScrollFrame) end
+categoryForJoint=function(name,d)
+	if d.isAccessory then return "Hats" end
+	local lower=name:lower()
+	if lower:find("root",1,true) or lower:find("torso",1,true) or lower:find("waist",1,true) then return "Torso" end
+	if lower:find("neck",1,true) or lower:find("head",1,true) then return "Head" end
+	if lower:find("shoulder",1,true) or lower:find("arm",1,true) or lower:find("elbow",1,true)
+		or lower:find("wrist",1,true) or lower:find("hand",1,true) then return "Arms" end
+	if lower:find("hip",1,true) or lower:find("leg",1,true) or lower:find("knee",1,true)
+		or lower:find("ankle",1,true) or lower:find("foot",1,true) then return "Legs" end
+	return "Other"
 end
+
+refreshJointSections=function()
+	local query=SearchInput.Text:lower()
+	for tabName,button in pairs(TabButtons) do
+		local selected=tabName==activeTab
+		button.BackgroundColor3=selected and C.accent or C.elevated
+		button.TextColor3=selected and C.bg or C.muted
+	end
+	local visibleCount=0
+	for name,section in pairs(jointSections) do
+		local queryMatch=query=="" or name:lower():find(query,1,true)~=nil
+			or (DISPLAY_NAMES[name] or ""):lower():find(query,1,true)~=nil
+			or (section.displayName or ""):lower():find(query,1,true)~=nil
+		local visible=section.category==activeTab and queryMatch
+		section.header.Visible=visible
+		section.body.Visible=visible and section.expanded
+		if visible then visibleCount=visibleCount+1 end
+		local arrow=section.header:FindFirstChildWhichIsA("TextLabel")
+		if arrow then arrow.Text=section.expanded and "▼" or "▶" end
+	end
+	EmptyTabLabel.Visible=visibleCount==0
+	EmptyTabLabel.Text=query=="" and "No editable joints in this tab" or "No matching joints in this tab"
+end
+
+rebuildJointUI=function()
+	activeSlider=nil
+	for _,section in pairs(jointSections) do
+		if section.header then section.header:Destroy() end
+		if section.body then section.body:Destroy() end
+	end
+	jointSections={}
+	loCount=0
+	ScrollFrame.CanvasPosition=Vector2.new(0,0)
+	for _,name in ipairs(jointOrder) do
+		local d=allJointData[name]
+		if d and categoryForJoint(name,d)==activeTab then buildJointSection(name,d,ScrollFrame) end
+	end
+	refreshJointSections()
+end
+
+rebuildJointUI()
+
+local characterWatchConnections={}
+local redetectPending=false
+local function clearCharacterWatch()
+	for _,connection in ipairs(characterWatchConnections) do connection:Disconnect() end
+	characterWatchConnections={}
+end
+
+local function scheduleJointRefresh(watchedCharacter)
+	if redetectPending then return end
+	redetectPending=true
+	task.delay(0.1,function()
+		redetectPending=false
+		if watchedCharacter~=char or watchedCharacter~=player.Character then return end
+		local previous=allJointData
+		detectAllMotors(watchedCharacter)
+		for name,current in pairs(allJointData) do
+			local oldData=previous[name]
+			if oldData and oldData.isAccessory==current.isAccessory then
+				for key,value in pairs(oldData) do
+					if key~="motor" and key~="weld" then current[key]=deepCopy(value) end
+				end
+			end
+		end
+		undoStack,redoStack={},{}
+		rebuildJointUI()
+	end)
+end
+
+local function watchCharacter(c)
+	clearCharacterWatch()
+	table.insert(characterWatchConnections,c.ChildAdded:Connect(function(child)
+		if child:IsA("Accessory") then scheduleJointRefresh(c) end
+	end))
+	table.insert(characterWatchConnections,c.ChildRemoved:Connect(function(child)
+		if child:IsA("Accessory") then scheduleJointRefresh(c) end
+	end))
+	local function isInAccessory(instance)
+		local parent=instance.Parent
+		while parent and parent~=c do
+			if parent:IsA("Accessory") then return true end
+			parent=parent.Parent
+		end
+		return false
+	end
+	local function shouldRefresh(instance)
+		return instance:IsA("Motor6D") or ((instance:IsA("Weld") or instance:IsA("Motor6D")) and isInAccessory(instance))
+	end
+	table.insert(characterWatchConnections,c.DescendantAdded:Connect(function(instance)
+		if shouldRefresh(instance) then scheduleJointRefresh(c) end
+	end))
+	table.insert(characterWatchConnections,c.DescendantRemoving:Connect(function(instance)
+		if shouldRefresh(instance) then scheduleJointRefresh(c) end
+	end))
+end
+
+watchCharacter(char)
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  PRESETS
 -- ═══════════════════════════════════════════════════════════════════════
+resetAllJointData=function()
+	for _,name in ipairs(jointOrder) do
+		local d=allJointData[name]
+		if d then resetJointData(d) end
+	end
+end
+
+local function findJointData(...)
+	for _,name in ipairs({...}) do
+		if allJointData[name] then return allJointData[name] end
+	end
+	return nil
+end
+
 local PRESETS={
 	{name="Idle",apply=function()
 		pushUndo()
-		local rj=allJointData.RootJoint; local ne=allJointData.Neck
-		local rs=allJointData.RightShoulder; local ls=allJointData.LeftShoulder
-		if rj then rj.sinePosY.amp=0.06; rj.sinePosY.speed=2 end
-		if ne then ne.rotX=ne.rotX-0.1 end
-		if rs then rs.sineX.amp=0.06; rs.sineX.speed=2 end
-		if ls then ls.sineX.amp=0.06; ls.sineX.speed=2 end
+		resetAllJointData()
+		local rj=findJointData("RootJoint","Root","Waist"); local ne=findJointData("Neck")
+		local rs=findJointData("RightShoulder"); local ls=findJointData("LeftShoulder")
+		if rj then rj.sinePosY.amp=0.06; rj.sinePosY.speed=1.6 end
+		if ne then ne.sineX.amp=0.08; ne.sineX.speed=1.6 end
+		if rs then rs.sineX.amp=0.06; rs.sineX.speed=1.6 end
+		if ls then ls.sineX.amp=0.06; ls.sineX.speed=1.6 end
 	end},
 	{name="Walk",apply=function()
 		pushUndo()
-		local rh=allJointData.RightHip;   local lh=allJointData.LeftHip
-		local rs=allJointData.RightShoulder; local ls=allJointData.LeftShoulder
-		local rj=allJointData.RootJoint;  local ne=allJointData.Neck
-		if rh then rh.sineX.amp=0.45; rh.sineX.speed=1 end
-		if lh then lh.sineX.amp=0.45; lh.sineX.speed=1; lh.sineX.reverse=true end
-		if rs then rs.sineX.amp=0.35; rs.sineX.speed=1; rs.sineX.reverse=true end
-		if ls then ls.sineX.amp=0.35; ls.sineX.speed=1 end
-		if rj then rj.sinePosY.amp=0.08; rj.sinePosY.speed=2 end
-		if ne then ne.sineY.amp=0.04; ne.sineY.speed=2 end
+		resetAllJointData()
+		local rh=findJointData("RightHip"); local lh=findJointData("LeftHip")
+		local rs=findJointData("RightShoulder"); local ls=findJointData("LeftShoulder")
+		local rj=findJointData("RootJoint","Root","Waist"); local ne=findJointData("Neck")
+		if rh then rh.sineX.amp=0.45; rh.sineX.speed=7.5 end
+		if lh then lh.sineX.amp=0.45; lh.sineX.speed=7.5; lh.sineX.reverse=true end
+		if rs then rs.sineX.amp=0.35; rs.sineX.speed=7.5; rs.sineX.reverse=true end
+		if ls then ls.sineX.amp=0.35; ls.sineX.speed=7.5 end
+		if rj then rj.sinePosY.amp=0.08; rj.sinePosY.speed=15 end
+		if ne then ne.sineY.amp=0.04; ne.sineY.speed=7.5 end
 	end},
 	{name="Crazy",apply=function()
 		pushUndo()
+		resetAllJointData()
 		for _,name in ipairs(jointOrder) do
 			local d=allJointData[name]; if not d then continue end
 			for _,ax in ipairs({"X","Y","Z"}) do
@@ -1100,47 +1359,42 @@ local PRESETS={
 	end},
 	{name="Reset All",apply=function()
 		pushUndo()
-		for _,name in ipairs(jointOrder) do
-			local d=allJointData[name]; if not d then continue end
-			local m=d.motor; local w=d.weld; local ia=d.isAccessory
-			local fresh=makeJointData(m or w)
-			for k,v in pairs(fresh) do
-				if k~="motor" and k~="weld" and k~="name" and k~="isAccessory" then d[k]=deepCopy(v) end
-			end
-			d.motor=m; d.weld=w; d.isAccessory=ia
-			lockRef[name]=nil
-		end
+		resetAllJointData()
 	end},
 }
 for _,p in ipairs(PRESETS) do
 	local b=btn({Size=UDim2.new(0,0,0,px(22)),AutomaticSize=Enum.AutomaticSize.X,
-		BackgroundColor3=C.elevated,Text=" "..p.name.." ",TextSize=FS.tiny,Font=Enum.Font.GothamBold},PresetRow)
+		BackgroundColor3=C.elevated,Text=" "..p.name.." ",
+		TextSize=FS.tiny,Font=Enum.Font.GothamBold},PresetRow)
 	pad(0,0,px(5),px(5),b); crn(px(4),b)
-	b.MouseButton1Click:Connect(p.apply)
+	b.MouseButton1Click:Connect(function()
+		p.apply()
+		rebuildJointUI()
+	end)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  SEARCH
 -- ═══════════════════════════════════════════════════════════════════════
 SearchInput:GetPropertyChangedSignal("Text"):Connect(function()
-	local q=SearchInput.Text:lower()
-	for name,sec in pairs(jointSections) do
-		local vis=q==""
-			or name:lower():find(q,1,true)~=nil
-			or (DISPLAY_NAMES[name] or ""):lower():find(q,1,true)~=nil
-		sec.header.Visible=vis
-		if not vis then sec.body.Visible=false end
-	end
+	if refreshJointSections then refreshJointSections() end
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  EXPORT / JSON
 -- ═══════════════════════════════════════════════════════════════════════
 local previewFrozen=false
+local jsonImportArmed=false
+local jsonDisplayMode=false
 ExportBtn.MouseButton1Click:Connect(function()
+	jsonImportArmed=false
+	jsonDisplayMode=false
+	CodeLabel.TextEditable=false
+	CodeLabel.PlaceholderText=""
+	CodeLabel.TextColor3=C.code
 	previewFrozen=not previewFrozen
 	ExportBtn.TextColor3=previewFrozen and C.warn or C.accent
-	ExportBtn.Text=previewFrozen and " >> Frozen " or " >> Export "
+	ExportBtn.Text=previewFrozen and " ⬡ Frozen " or " ⬡ Export "
 	if previewFrozen then CodeLabel.Text=generateCode() end
 end)
 
@@ -1148,14 +1402,20 @@ local function serializeData()
 	local t={}
 	for _,name in ipairs(jointOrder) do
 		local d=allJointData[name]; if not d then continue end
-		local function cs(s) return {amp=s.amp,speed=s.speed,offset=s.offset,reverse=s.reverse} end
-		local function csp(s) return {enabled=s.enabled,speed=s.speed,reverse=s.reverse} end
+		local function copySine(s) return {amp=s.amp,speed=s.speed,offset=s.offset,reverse=s.reverse} end
+		local function copySpin(s) return {enabled=s.enabled,speed=s.speed,reverse=s.reverse} end
 		t[name]={
 			posX=d.posX,posY=d.posY,posZ=d.posZ,
 			rotX=d.rotX,rotY=d.rotY,rotZ=d.rotZ,
-			sineX=cs(d.sineX),sineY=cs(d.sineY),sineZ=cs(d.sineZ),
-			sinePosX=cs(d.sinePosX),sinePosY=cs(d.sinePosY),sinePosZ=cs(d.sinePosZ),
-			spinX=csp(d.spinX),spinY=csp(d.spinY),spinZ=csp(d.spinZ),
+			baseRotX=d.baseRotX or 0,baseRotY=d.baseRotY or 0,baseRotZ=d.baseRotZ or 0,
+			selfPivotX=d.selfPivotX or 0,selfPivotY=d.selfPivotY or 0,selfPivotZ=d.selfPivotZ or 0,
+			baseRotationFirst=d.baseRotationFirst,
+			lockX=d.lockX,lockY=d.lockY,lockZ=d.lockZ,
+			sineX=copySine(d.sineX),sineY=copySine(d.sineY),sineZ=copySine(d.sineZ),
+			sinePosX=copySine(d.sinePosX),sinePosY=copySine(d.sinePosY),sinePosZ=copySine(d.sinePosZ),
+			spinX=copySpin(d.spinX),spinY=copySpin(d.spinY),spinZ=copySpin(d.spinZ),
+			baseSineX=copySine(d.baseSineX),baseSineY=copySine(d.baseSineY),baseSineZ=copySine(d.baseSineZ),
+			baseSpinX=copySpin(d.baseSpinX),baseSpinY=copySpin(d.baseSpinY),baseSpinZ=copySpin(d.baseSpinZ),
 			enabled=d.enabled,
 		}
 	end
@@ -1163,26 +1423,102 @@ local function serializeData()
 end
 
 JsonExpBtn.MouseButton1Click:Connect(function()
+	jsonImportArmed=false
+	jsonDisplayMode=true
+	CodeLabel.TextEditable=false
+	CodeLabel.PlaceholderText=""
+	CodeLabel.TextColor3=C.code
 	local ok,json=pcall(function() return HttpService:JSONEncode(serializeData()) end)
 	CodeLabel.Text=ok and json or "-- JSON encode failed"
 end)
 
-JsonImpBtn.MouseButton1Click:Connect(function()
-	CodeLabel.Text="-- Paste JSON here then click ^ JSON again"
-	local conn; conn=JsonImpBtn.MouseButton1Click:Connect(function()
-		conn:Disconnect()
-		local ok,t=pcall(function() return HttpService:JSONDecode(CodeLabel.Text) end)
-		if ok and type(t)=="table" then
-			pushUndo()
-			for name,vals in pairs(t) do
-				local d=allJointData[name]; if not d then continue end
-				for k,v in pairs(vals) do
-					if k~="motor" and k~="weld" and k~="name" and k~="isAccessory" then d[k]=deepCopy(v) end
+local NUMBER_FIELDS={"posX","posY","posZ","rotX","rotY","rotZ","baseRotX","baseRotY","baseRotZ",
+	"selfPivotX","selfPivotY","selfPivotZ"}
+local BOOLEAN_FIELDS={"enabled","baseRotationFirst","lockX","lockY","lockZ"}
+local SINE_FIELDS={"sineX","sineY","sineZ","sinePosX","sinePosY","sinePosZ",
+	"baseSineX","baseSineY","baseSineZ"}
+local SPIN_FIELDS={"spinX","spinY","spinZ","baseSpinX","baseSpinY","baseSpinZ"}
+local function validateImportTable(data)
+	if type(data)~="table" then return false end
+	for name,values in pairs(data) do
+		if type(name)~="string" or type(values)~="table" then return false end
+		for _,key in ipairs(NUMBER_FIELDS) do
+			if values[key]~=nil and not isSafeNumber(values[key]) then return false end
+		end
+		for _,key in ipairs(BOOLEAN_FIELDS) do
+			if values[key]~=nil and type(values[key])~="boolean" then return false end
+		end
+		for _,key in ipairs(SINE_FIELDS) do
+			local axis=values[key]
+			if axis~=nil then
+				if type(axis)~="table" then return false end
+				for _,numberKey in ipairs({"amp","speed","offset"}) do
+					if axis[numberKey]~=nil and not isSafeNumber(axis[numberKey]) then return false end
 				end
+				if axis.reverse~=nil and type(axis.reverse)~="boolean" then return false end
 			end
-			CodeLabel.Text="-- JSON imported OK"
-		else CodeLabel.Text="-- Invalid JSON" end
-	end)
+		end
+		for _,key in ipairs(SPIN_FIELDS) do
+			local axis=values[key]
+			if axis~=nil then
+				if type(axis)~="table" then return false end
+				if axis.speed~=nil and not isSafeNumber(axis.speed) then return false end
+				if axis.enabled~=nil and type(axis.enabled)~="boolean" then return false end
+				if axis.reverse~=nil and type(axis.reverse)~="boolean" then return false end
+			end
+		end
+	end
+	return true
+end
+
+local function applyImportedTable(data)
+	for name,values in pairs(data) do
+		local d=allJointData[name]
+		if d then
+			for _,key in ipairs(NUMBER_FIELDS) do if values[key]~=nil then d[key]=values[key] end end
+			for _,key in ipairs(BOOLEAN_FIELDS) do if values[key]~=nil then d[key]=values[key] end end
+			for _,key in ipairs(SINE_FIELDS) do
+				if values[key] then for _,field in ipairs({"amp","speed","offset","reverse"}) do
+					if values[key][field]~=nil then d[key][field]=values[key][field] end
+				end end
+			end
+			for _,key in ipairs(SPIN_FIELDS) do
+				if values[key] then for _,field in ipairs({"enabled","speed","reverse"}) do
+					if values[key][field]~=nil then d[key][field]=values[key][field] end
+				end end
+			end
+		end
+	end
+end
+
+JsonImpBtn.MouseButton1Click:Connect(function()
+	if not jsonImportArmed then
+		jsonImportArmed=true
+		jsonDisplayMode=true
+		CodeLabel.TextEditable=true
+		CodeLabel.Text=""
+		CodeLabel.TextColor3=C.code
+		CodeLabel.PlaceholderText="Paste JSON here, then click ↑ JSON to import"
+		CodeLabel:CaptureFocus()
+		return
+	end
+
+	local ok,data=pcall(function() return HttpService:JSONDecode(CodeLabel.Text) end)
+	if not ok or not validateImportTable(data) then
+		CodeLabel.TextColor3=C.red
+		CodeLabel.PlaceholderText="Invalid JSON or values; correct it and click ↑ JSON again"
+		return
+	end
+
+	pushUndo()
+	applyImportedTable(data)
+	jsonImportArmed=false
+	jsonDisplayMode=false
+	CodeLabel.TextEditable=false
+	CodeLabel.PlaceholderText=""
+	CodeLabel.TextColor3=C.code
+	CodeLabel.Text="-- ✓ JSON imported"
+	rebuildJointUI()
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -1191,7 +1527,7 @@ end)
 local previewTimer=0
 RunService.RenderStepped:Connect(function(dt)
 	previewTimer=previewTimer+dt
-	if previewTimer>=0.5 and not previewFrozen then
+	if previewTimer>=0.5 and not previewFrozen and not jsonDisplayMode then
 		previewTimer=0
 		local lines,i={},0
 		for line in generateCode():gmatch("[^\n]+") do
@@ -1202,20 +1538,26 @@ RunService.RenderStepped:Connect(function(dt)
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════
---  RESPAWN
+--  CHARACTER RESPAWN
 -- ═══════════════════════════════════════════════════════════════════════
 player.CharacterAdded:Connect(function(newChar)
+	if rtConn then rtConn:Disconnect(); rtConn=nil end
+	clearCharacterWatch()
 	char=newChar
+	undoStack,redoStack={},{}
 	waitForRig(newChar)
 	disableAnimate(newChar)
 	detectAllMotors(newChar)
-	lockRef={}
+	rebuildJointUI()
+	watchCharacter(newChar)
 	startRuntime()
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  INIT
 -- ═══════════════════════════════════════════════════════════════════════
-task.delay(0.25,function() CodeLabel.Text=generateCode() end)
+task.delay(0.25,function()
+	if not jsonDisplayMode and not previewFrozen then CodeLabel.Text=generateCode() end
+end)
 local n=0; for _ in pairs(allJointData) do n=n+1 end
 print(fmt("[CFrameAnimEditor v3.1]  scale=%.2fx  %dx%d  joints=%d",S,WIN_W,WIN_H,n))
